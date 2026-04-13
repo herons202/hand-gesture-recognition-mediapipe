@@ -4,16 +4,105 @@ import csv
 import copy
 import argparse
 import itertools
-from collections import Counter
+from collections import Counter, namedtuple
 from collections import deque
+import os
+import urllib.request
 
 import cv2 as cv
 import numpy as np
 import mediapipe as mp
+from mediapipe import tasks
 
 from utils import CvFpsCalc
 from model import KeyPointClassifier
 from model import PointHistoryClassifier
+
+
+# Compatibility wrapper for MediaPipe Hands using Tasks API
+class HandsCompat:
+    """Wrapper for MediaPipe hand landmark detection using the Tasks API"""
+    def __init__(self, static_image_mode=False, max_num_hands=2,
+                 min_detection_confidence=0.5, min_tracking_confidence=0.5):
+        # Download hand landmarker model if not exists
+        model_path = self._get_hand_landmarker_model()
+        
+        # Create options for the Tasks API
+        options = tasks.vision.HandLandmarkerOptions(
+            base_options=tasks.BaseOptions(model_asset_path=model_path),
+            num_hands=max_num_hands,
+            min_hand_detection_confidence=min_detection_confidence,
+            min_hand_presence_confidence=min_tracking_confidence,
+            running_mode=tasks.vision.RunningMode.IMAGE
+        )
+        self.hand_landmarker = tasks.vision.HandLandmarker.create_from_options(options)
+        self.static_image_mode = static_image_mode
+        
+    def _get_hand_landmarker_model(self):
+        """Download and cache the hand landmarker model"""
+        model_dir = os.path.join(os.path.dirname(__file__), 'model', 'hand_landmarker')
+        os.makedirs(model_dir, exist_ok=True)
+        
+        model_path = os.path.join(model_dir, 'hand_landmarker.task')
+        
+        if not os.path.exists(model_path):
+            print("Downloading hand landmarker model...")
+            model_url = 'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/latest/hand_landmarker.task'
+            try:
+                urllib.request.urlretrieve(model_url, model_path)
+                print(f"Model downloaded to {model_path}")
+            except Exception as e:
+                print(f"Error downloading model: {e}")
+                raise
+        
+        return model_path
+
+    def process(self, image):
+        """Process image and return results in format compatible with old API"""
+        # Convert BGR to RGB
+        rgb_image = cv.cvtColor(image, cv.COLOR_BGR2RGB)
+        
+        # Create MediaPipe Image
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_image)
+        
+        # Run detection
+        detection_result = self.hand_landmarker.detect(mp_image)
+        
+        # Create namedtuples for backward compatibility
+        Landmark = namedtuple('Landmark', ['x', 'y', 'z', 'presence'])
+        LandmarkList = namedtuple('LandmarkList', ['landmark'])
+        Classification = namedtuple('Classification', ['label', 'score'])
+        Handedness = namedtuple('Handedness', ['classification'])
+        Results = namedtuple('Results', ['multi_hand_landmarks', 'multi_handedness'])
+        
+        # Convert results to old API format
+        multi_hand_landmarks = []
+        multi_handedness = []
+        
+        if detection_result.hand_landmarks:
+            for hand_landmarks in detection_result.hand_landmarks:
+                landmarks = []
+                for lm in hand_landmarks:
+                    landmark = Landmark(x=lm.x, y=lm.y, z=lm.z, 
+                                       presence=getattr(lm, 'presence', 1.0))
+                    landmarks.append(landmark)
+                landmark_list = LandmarkList(landmark=landmarks)
+                multi_hand_landmarks.append(landmark_list)
+        
+        if detection_result.handedness:
+            for handedness_data in detection_result.handedness:
+                if handedness_data:
+                    # Get the top classification
+                    top_classification = handedness_data[0]
+                    classification = Classification(
+                        label=top_classification.category_name,
+                        score=top_classification.score
+                    )
+                    handedness = Handedness(classification=[classification])
+                    multi_handedness.append(handedness)
+        
+        return Results(multi_hand_landmarks=multi_hand_landmarks if multi_hand_landmarks else None,
+                      multi_handedness=multi_handedness if multi_handedness else None)
 
 
 def get_args():
@@ -58,8 +147,7 @@ def main():
     cap.set(cv.CAP_PROP_FRAME_HEIGHT, cap_height)
 
     # Model load #############################################################
-    mp_hands = mp.solutions.hands
-    hands = mp_hands.Hands(
+    hands = HandsCompat(
         static_image_mode=use_static_image_mode,
         max_num_hands=1,
         min_detection_confidence=min_detection_confidence,
@@ -115,11 +203,9 @@ def main():
         debug_image = copy.deepcopy(image)
 
         # Detection implementation #############################################################
-        image = cv.cvtColor(image, cv.COLOR_BGR2RGB)
+        image_for_detection = cv.cvtColor(image, cv.COLOR_BGR2RGB)
 
-        image.flags.writeable = False
-        results = hands.process(image)
-        image.flags.writeable = True
+        results = hands.process(image_for_detection)
 
         #  ####################################################################
         if results.multi_hand_landmarks is not None:
